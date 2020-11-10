@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import gensim
 import gc
+import gensim.models.keyedvectors as w2v
 from gensim.test.utils import datapath, get_tmpfile
 from gensim.models import KeyedVectors
 from gensim.scripts.glove2word2vec import glove2word2vec
@@ -29,14 +30,13 @@ MODEL_DIR = "./models/"
 MODEL_FILE = "glove.840B.300d.txt"
 VEC_MODEL_FILE = "glove_vec.840B.300d.txt"
 OUTPUT_DIR = "./outputs/"
-OUTPUT_FILE = "ans_test.csv"
+OUTPUT_FILE = "ans_final.csv"
 
 nltk.download('punkt')
 nltk.download('stopwords')
 stop_words = set(stopwords.words('english'))
 
 seq_len = 0
-
 
 def preprocess(text):
     # word to lowercase
@@ -52,7 +52,7 @@ def preprocess(text):
 
 def pad_zeros(doc):
     if len(doc) < seq_len:
-        new_doc = ['</s>']*(seq_len - len(doc))
+        new_doc = ['<']*(seq_len - len(doc))
         new_doc += doc
         return new_doc
     else:
@@ -65,27 +65,50 @@ def document_vector(vocab, doc):
 
     return [vocab[word].index for word in doc]
 
+def restrict_w2v(w2v, restricted_word_set):
+    new_vectors = []
+    new_vocab = {}
+    new_index2entity = []
+    new_vectors_norm = []
+
+    for i in range(len(w2v.vocab)):
+        word = w2v.index2entity[i]
+        vec = w2v.vectors[i]
+        vocab = w2v.vocab[word]
+        vec_norm = w2v.vectors_norm[i]
+        if word in restricted_word_set:
+            vocab.index = len(new_index2entity)
+            new_index2entity.append(word)
+            new_vocab[word] = vocab
+            new_vectors.append(vec)
+            new_vectors_norm.append(vec_norm)
+    w2v.vocab = new_vocab
+    w2v.vectors = np.array(new_vectors)
+    w2v.index2entity = np.array(new_index2entity)
+    w2v.index2word = np.array(new_index2entity)
+
 
 if __name__ == '__main__':
 
     # move model to GPU, if available
-    train_on_gpu=torch.cuda.is_available()
+    train_on_gpu = torch.cuda.is_available()
     if(train_on_gpu):
         print('Training on GPU.')
 
     # load Glove pre train model
     # _ = glove2word2vec(MODEL_DIR+MODEL_FILE, MODEL_DIR+VEC_MODEL_FILE)
-    model = KeyedVectors.load_word2vec_format(MODEL_DIR+VEC_MODEL_FILE, binary=False)
+    # model = KeyedVectors.load_word2vec_format(
+        # MODEL_DIR+VEC_MODEL_FILE, binary=False)
     # check dimension of word vectors
+    model = gensim.models.KeyedVectors.load_word2vec_format('./models/word2vec.model.bin', binary=False)
     print(model.vectors.shape)
 
     weights = torch.FloatTensor(model.vectors)
     vocab_dict = model.vocab.copy()
-    print(weights.shape)
 
     # remove model to free RAM
-    # %xdel model
-    # %reset out
+    # del model
+    # reset out
     gc.collect()
 
     main_data = pd.read_csv(DATASET_DIR+TRAINING_DATASET_FILE)
@@ -126,96 +149,14 @@ if __name__ == '__main__':
     test_data_only_df = data_only_df[-227:]
     data_only_df = data_only_df[:-227]
 
-    full_dataset = TextDataset(data_only_df)
-    train_size = int(0.8 * len(full_dataset))
-    test_size = len(full_dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, test_size])
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    valid_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-
-    # test the loader
-    dataiter = iter(train_loader)
-    sample_x, sample_y = dataiter.next()
-    print('Sample input size: ', sample_x.size())  # batch_size, seq_length
-    print('Sample input: \n', sample_x)
-    print()
-    print('Sample label size: ', sample_y.size())  # batch_size
-    print('Sample label: \n', sample_y)
-
-    net = AttractivenessRNN(weights, weights.shape[1], 32, 2)
-    if(train_on_gpu):
+    net = AttractivenessRNN(weights, weights.shape[1], 8, 2)
+    net.load_state_dict(torch.load('./weights/weights.pth'))
+    if (train_on_gpu):
         net.cuda()
-
-    optimizer = torch.optim.Adam(net.parameters(), lr=LR)
-    criterion = nn.MSELoss()
-    counter = 0
-    print_every = 100
-    clip = 5  # gradient clipping
-
-    net.train()
-    # train for some number of epochs
-    for e in range(EPOCH):
-        # initialize hidden state
-        h = net.init_hidden(BATCH_SIZE, train_on_gpu)
-
-        # batch loop
-        for inputs, labels in train_loader:
-            counter += 1
-
-            if(train_on_gpu):
-                inputs, labels = inputs.cuda(), labels.cuda()
-
-            # creating new variables for the hidden state, otherwise
-            # we'd backprop through the entire training history
-            h = tuple([each.data for each in h])
-
-            # zero accumulated gradients
-            net.zero_grad()
-
-            # get the output from the model
-            output, h = net(inputs, h)
-
-            # calculate the loss and perform backprop
-            loss = criterion(output.squeeze(), labels.float())
-            loss.backward()
-            # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
-            # nn.utils.clip_grad_norm_(net.parameters(), clip)
-            optimizer.step()
-
-            # loss stats
-            if counter % print_every == 0:
-                # get validation loss
-                val_h = net.init_hidden(BATCH_SIZE, train_on_gpu)
-                val_losses = []
-                net.eval()
-                for inputs, labels in valid_loader:
-
-                    # creating new variables for the hidden state, otherwise
-                    # we'd backprop through the entire training history
-                    val_h = tuple([each.data for each in val_h])
-
-                    if(train_on_gpu):
-                        inputs, labels = inputs.cuda(), labels.cuda()
-
-                    output, val_h = net(inputs, val_h)
-                    val_loss = criterion(output.squeeze(), labels.float())
-                    val_losses.append(val_loss.item())
-
-                net.train()
-                print("Epoch: {}/{}...".format(e+1, EPOCH),
-                    "Step: {}...".format(counter),
-                    "Loss: {:.6f}...".format(loss.item()),
-                    "Val Loss: {:.6f}".format(np.mean(val_losses)))
+    else:
+        net.cpu()
+    
     net.eval()
-
-    sample_input = test_data_only_df.iloc[0]['word_list']
-    sample_input = torch.LongTensor([sample_input])
-    sample_input.size()
-
-    h = net.init_hidden(1, train_on_gpu)
-    h = tuple([each.data for each in h])
-    pred, h = net(sample_input.cuda(), h)
-    pred.squeeze().item()
 
     pred_input = test_data_only_df['word_list'].values.tolist()
     pred_input = torch.LongTensor(pred_input)
