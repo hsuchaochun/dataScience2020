@@ -18,4 +18,4 @@ CATKIN_IGNORE
 *.zip
 *.npy
 pozyx_ros/result
-*.txt
+hw/4/src/data
